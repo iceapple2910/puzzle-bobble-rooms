@@ -8,7 +8,7 @@
       { "name": "ROOMS", "class_name": "Room" }
     ]
   },
-  "exports": {
-    "Room": { "type": "durable-object", "storage": "sqlite" }
-  }
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Room"] }
+  ]
 }
