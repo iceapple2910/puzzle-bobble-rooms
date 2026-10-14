@@ -70,8 +70,9 @@ export default {
       return json({
         ok: true,
         service: "puzzle-bobble-room-server",
-        version: 3,
+        version: 4,
         location_hint: ROOM_LOCATION_HINT,
+        note: "location_hint applies only on first getByName for a new DO name",
         limits: { ws: MAX_WS_MESSAGE_CHARS, game: GAME_DATA_LIMITS }
       });
     }
@@ -119,6 +120,9 @@ export default {
 };
 
 export class Room extends DurableObject {
+  /** In-memory room cache — avoids storage round-trip on every WS frame (inflates RTT). */
+  _roomCache = null;
+
   peers() {
     return this.ctx.getWebSockets().map(ws => ({ ws, ...ws.deserializeAttachment() }))
       .filter(p => p.slot === 1 || p.slot === 2);
@@ -137,6 +141,53 @@ export class Room extends DurableObject {
   presence() {
     const players = this.peers().map(p => ({ player: p.slot, ready: !!p.ready }));
     return { type: "presence", players };
+  }
+
+  async loadRoom() {
+    if (this._roomCache && Date.now() < this._roomCache.expiresAt) {
+      return this._roomCache;
+    }
+    const room = await this.ctx.storage.get("room");
+    this._roomCache = room || null;
+    return this._roomCache;
+  }
+
+  /** Tiny latency probes — no storage, no game ACL. Joined peers only. */
+  handleDiagFast(ws, slot, msg, t0) {
+    const procMs = Math.round((performance.now() - t0) * 1000) / 1000;
+    if (msg.type === "diag_echo") {
+      this.send(ws, {
+        type: "diag_echo_reply",
+        id: msg.id,
+        path: "fast",
+        server_proc_ms: procMs
+      });
+      return true;
+    }
+    if (msg.type === "diag_relay") {
+      const hop = msg.hop === "back" ? "back" : "out";
+      this.broadcast(
+        {
+          type: "diag_relay",
+          from: slot,
+          id: msg.id,
+          hop,
+          server_proc_ms: procMs
+        },
+        ws
+      );
+      return true;
+    }
+    if (msg.type === "ping") {
+      this.send(ws, {
+        type: "pong",
+        t: typeof msg.t === "number" ? msg.t : Date.now(),
+        path: "fast",
+        server_proc_ms: procMs
+      });
+      return true;
+    }
+    return false;
   }
 
   /** Host-authoritative relay rules for Godot game events. */
@@ -176,19 +227,23 @@ export class Room extends DurableObject {
       if (!isRoomCode(data.code) || typeof data.hostToken !== "string") {
         return json({ error: "bad_request" }, 400);
       }
+      const now = Date.now();
       const room = {
         code: data.code,
         hostToken: data.hostToken,
-        expiresAt: Date.now() + ROOM_LIFETIME_MS,
-        started: false
+        expiresAt: now + ROOM_LIFETIME_MS,
+        started: false,
+        locationHint: ROOM_LOCATION_HINT,
+        createdAt: now
       };
       await this.ctx.storage.put("room", room);
+      this._roomCache = room;
       await this.ctx.storage.setAlarm(room.expiresAt);
-      console.log(`room_init code=${room.code}`);
-      return json({ ok: true }, 201);
+      console.log(`room_init code=${room.code} locationHint=${room.locationHint}`);
+      return json({ ok: true, location_hint: room.locationHint, created_at: room.createdAt }, 201);
     }
 
-    const room = await this.ctx.storage.get("room");
+    const room = await this.loadRoom();
     if (!room || Date.now() >= room.expiresAt) {
       return json({ error: "room_not_found_or_expired" }, 404);
     }
@@ -199,7 +254,10 @@ export class Room extends DurableObject {
         code: room.code,
         players: this.presence().players,
         started: room.started,
-        expires_at: room.expiresAt
+        expires_at: room.expiresAt,
+        location_hint: room.locationHint || null,
+        created_at: room.createdAt || null,
+        hint_note: "hint recorded at first init; existing DOs do not move"
       });
     }
 
@@ -215,6 +273,8 @@ export class Room extends DurableObject {
     this.send(server, {
       type: "hello",
       code: room.code,
+      location_hint: room.locationHint || null,
+      created_at: room.createdAt || null,
       message: "Send {type:'join', host_token?:'...'}"
     });
     console.log(`ws_accept code=${room.code}`);
@@ -222,6 +282,7 @@ export class Room extends DurableObject {
   }
 
   async webSocketMessage(ws, raw) {
+    const t0 = performance.now();
     if (typeof raw !== "string" || raw.length > MAX_WS_MESSAGE_CHARS) {
       this.send(ws, { type: "error", error: "invalid_message" });
       return;
@@ -233,13 +294,33 @@ export class Room extends DurableObject {
     }
     if (!msg || typeof msg !== "object") return;
 
-    const room = await this.ctx.storage.get("room");
+    const oldAttachment = ws.deserializeAttachment() || { slot: 0, ready: false };
+
+    // Fast path: joined peers — diag + ping with NO storage await.
+    if (oldAttachment.slot && this.handleDiagFast(ws, oldAttachment.slot, msg, t0)) {
+      return;
+    }
+
+    // Slow echo: intentionally await storage so clients can measure inflation.
+    if (oldAttachment.slot && msg.type === "diag_echo_slow") {
+      const roomSlow = await this.loadRoom();
+      const procMs = Math.round((performance.now() - t0) * 1000) / 1000;
+      this.send(ws, {
+        type: "diag_echo_reply",
+        id: msg.id,
+        path: "storage",
+        server_proc_ms: procMs,
+        room_ok: !!(roomSlow && Date.now() < roomSlow.expiresAt)
+      });
+      return;
+    }
+
+    const room = await this.loadRoom();
     if (!room || Date.now() >= room.expiresAt) {
       this.send(ws, { type: "error", error: "room_expired" });
       ws.close(1000, "Room expired");
       return;
     }
-    const oldAttachment = ws.deserializeAttachment() || { slot: 0, ready: false };
 
     if (!oldAttachment.slot) {
       if (msg.type !== "join") {
@@ -259,24 +340,24 @@ export class Room extends DurableObject {
         type: "joined",
         player: slot,
         role: slot === 1 ? "host" : "guest",
-        code: room.code
+        code: room.code,
+        location_hint: room.locationHint || null,
+        created_at: room.createdAt || null
       });
       this.broadcast(this.presence());
-      console.log(`joined code=${room.code} player=${slot}`);
+      console.log(`joined code=${room.code} player=${slot} hint=${room.locationHint || "?"}`);
       return;
     }
 
     const slot = oldAttachment.slot;
-    if (msg.type === "ping") {
-      this.send(ws, { type: "pong", t: typeof msg.t === "number" ? msg.t : Date.now() });
-      return;
-    }
     if (msg.type === "ready" && typeof msg.ready === "boolean") {
       ws.serializeAttachment({ ...oldAttachment, ready: msg.ready });
       this.broadcast(this.presence());
       const peers = this.peers();
       if (!room.started && peers.length === 2 && peers.every(p => p.ready)) {
-        await this.ctx.storage.put("room", { ...room, started: true });
+        const next = { ...room, started: true };
+        await this.ctx.storage.put("room", next);
+        this._roomCache = next;
         this.broadcast({ type: "match_start" });
         console.log(`match_start code=${room.code}`);
       }
@@ -306,10 +387,12 @@ export class Room extends DurableObject {
   async onLeave(ws) {
     const attachment = ws.deserializeAttachment() || {};
     if (!attachment.slot) return;
-    const room = await this.ctx.storage.get("room");
+    const room = await this.loadRoom();
     if (room && room.started) {
       // Match ends when either peer leaves; clients handle GAME OVER hold locally.
-      await this.ctx.storage.put("room", { ...room, started: false });
+      const next = { ...room, started: false };
+      await this.ctx.storage.put("room", next);
+      this._roomCache = next;
     }
     this.broadcast({ type: "player_left", player: attachment.slot }, ws);
     const remaining = this.peers().filter(p => p.ws !== ws);
