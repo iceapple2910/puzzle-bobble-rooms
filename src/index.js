@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { DIAG_PAGE } from "./diag_page.js";
 
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const ROOM_LIFETIME_MS = 6 * 60 * 60 * 1000;
@@ -52,7 +53,52 @@ function dataSize(data) {
   }
 }
 
-const TEST_PAGE = "<!doctype html>\n<html lang=\"ko\">\n<head>\n<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Bubble Battle — 서버 테스트</title>\n<style>\n:root{font-family:system-ui,sans-serif;color:#ecf3ff;background:#10172a}\n*{box-sizing:border-box}main{max-width:620px;margin:8vh auto;padding:24px;border:1px solid #344b70;border-radius:18px;background:#1a2540}\nh1{margin-top:0}p{color:#b9c8e7}input,button{padding:12px;border-radius:9px;font:inherit}input{background:#101a30;color:white;border:1px solid #496088;text-transform:uppercase;width:140px}\nbutton{background:#427fea;color:white;border:0;cursor:pointer}button.secondary{background:#3e536e}button:disabled{opacity:.45;cursor:default}\n.row{display:flex;gap:9px;flex-wrap:wrap;margin:12px 0}.status{padding:12px;border-radius:8px;background:#0b1833;color:#a9d3ff}\n#log{white-space:pre-wrap;height:220px;overflow:auto;background:#0b1222;border-radius:10px;padding:12px;font:12px/1.6 monospace;color:#c1dbfa}\ncode{color:#ffd977}small{color:#95aacc}\n</style>\n</head>\n<body><main>\n<h1>🫧 Bubble Battle · 서버 테스트</h1>\n<p>Cloudflare Workers + Durable Objects 연결 테스트. 이 페이지는 실제 게임이 아니라 방 코드와 실시간 통신을 검사하는 용도입니다.</p>\n<div class=\"row\"><button id=\"create\">새 방 만들기</button><input id=\"code\" maxlength=\"6\" placeholder=\"방 코드\" autocomplete=\"off\"><button id=\"join\" class=\"secondary\">방 참가</button></div>\n<div id=\"status\" class=\"status\">연결 안 됨</div>\n<div class=\"row\"><button id=\"ready\" disabled>준비 완료</button><button id=\"send\" disabled class=\"secondary\">테스트 메시지 전송</button><button id=\"leave\" disabled class=\"secondary\">연결 해제</button></div>\n<p><small>테스트 방법: 한 탭에서 방 만들기 → 다른 탭/기기에서 같은 사이트 접속 → 코드 입력 → 두 쪽에서 준비 완료 → 메시지 전송</small></p>\n<div id=\"log\" aria-label=\"서버 로그\"></div>\n</main>\n<script>\nlet socket=null, roomCode=null, hostToken=null, ready=false;\nconst $=id=>document.getElementById(id);\nfunction log(s){ $('log').textContent += `${new Date().toLocaleTimeString()} ${s}\\n`; $('log').scrollTop=$('log').scrollHeight; }\nfunction status(s){ $('status').textContent=s; }\nfunction send(m){if(socket && socket.readyState===WebSocket.OPEN) socket.send(JSON.stringify(m));}\nfunction controls(connected){$('ready').disabled=!connected;$('send').disabled=!connected;$('leave').disabled=!connected;}\nfunction connect(code,token){\n  if(socket)socket.close();\n  roomCode=code;hostToken=token;ready=false;\n  const protocol=location.protocol==='https:'?'wss:':'ws:';\n  socket=new WebSocket(`${protocol}//${location.host}/api/rooms/${code}/ws`);\n  status(`방 ${code} 접속 중...`);\n  socket.onopen=()=>{send({type:'join',host_token:token});log('WebSocket 연결됨');};\n  socket.onmessage=e=>{let m;try{m=JSON.parse(e.data)}catch{return}; log(JSON.stringify(m));\n    if(m.type==='joined'){controls(true);status(`방 ${code} | ${m.role==='host'?'방장 (1P)':'참가자 (2P)'}`)}\n    if(m.type==='match_start')status(`방 ${code} | 양쪽 준비 완료, 게임 시작 이벤트 수신!`);\n    if(m.type==='error')status(`오류: ${m.error}`);\n    if(m.type==='player_left')status(`방 ${code} | ${m.player}P가 나감`);\n  };\n  socket.onerror=()=>log('연결 오류. 주소 및 배포 설정 확인.');\n  socket.onclose=e=>{log(`연결 종료 ${e.code}`);controls(false);ready=false;status('연결 종료됨')};\n}\n$('create').onclick=async()=>{\n  try{let r=await fetch('/api/rooms',{method:'POST'});let d=await r.json();if(!d.ok)throw Error(JSON.stringify(d));\n    $('code').value=d.code;log(`방 생성 성공: ${d.code}`);connect(d.code,d.host_token);\n  }catch(e){log('방 생성 실패: '+e.message)}\n};\n$('join').onclick=()=>{const code=$('code').value.toUpperCase().trim();if(code.length!==6)return status('6자리 코드를 입력해 줘');connect(code,null)};\n$('ready').onclick=()=>{ready=!ready;send({type:'ready',ready});$('ready').textContent=ready?'준비 취소':'준비 완료'};\n$('send').onclick=()=>send({type:'game',event:'test_message',data:{hello:'버블 보블!',time:Date.now()}});\n$('leave').onclick=()=>{if(socket)socket.close(1000,'Left room');};\n</script></body></html>\n";
+function edgeColo(request) {
+  return request.cf?.colo || null;
+}
+
+/**
+ * Worker-only WebSocket echo — does NOT touch Durable Objects / storage.
+ * Terminates at the edge colo that accepted the upgrade (≠ DO location).
+ */
+function handleWorkerEchoWs(request) {
+  if (request.method !== "GET" || request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+    return json({ error: "websocket_upgrade_required", path: "/api/echo/ws" }, 426);
+  }
+  const colo = edgeColo(request);
+  const pair = new WebSocketPair();
+  const [client, server] = Object.values(pair);
+  server.accept();
+  server.send(JSON.stringify({
+    type: "echo_hello",
+    via: "worker",
+    edge_colo: colo,
+    note: "WS terminates at Worker edge colo; this is NOT the Durable Object location"
+  }));
+  server.addEventListener("message", (event) => {
+    const t0 = performance.now();
+    const raw = typeof event.data === "string" ? event.data : "";
+    if (raw.length > 4096) return;
+    let msg;
+    try { msg = JSON.parse(raw); } catch (_) { return; }
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type !== "diag_echo" && msg.type !== "echo") return;
+    const procMs = Math.round((performance.now() - t0) * 1000) / 1000;
+    server.send(JSON.stringify({
+      type: "diag_echo_reply",
+      id: msg.id,
+      token: msg.token ?? null,
+      t_client_us: msg.t_client_us ?? null,
+      path: "worker",
+      via: "worker",
+      edge_colo: colo,
+      server_proc_ms: procMs
+    }));
+  });
+  return new Response(null, { status: 101, webSocket: client });
+}
+
+const TEST_PAGE = "<!doctype html>\n<html lang=\"ko\">\n<head>\n<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Bubble Battle — 서버 테스트</title>\n<style>\n:root{font-family:system-ui,sans-serif;color:#ecf3ff;background:#10172a}\n*{box-sizing:border-box}main{max-width:620px;margin:8vh auto;padding:24px;border:1px solid #344b70;border-radius:18px;background:#1a2540}\nh1{margin-top:0}p{color:#b9c8e7}input,button{padding:12px;border-radius:9px;font:inherit}input{background:#101a30;color:white;border:1px solid #496088;text-transform:uppercase;width:140px}\nbutton{background:#427fea;color:white;border:0;cursor:pointer}button.secondary{background:#3e536e}button:disabled{opacity:.45;cursor:default}\n.row{display:flex;gap:9px;flex-wrap:wrap;margin:12px 0}.status{padding:12px;border-radius:8px;background:#0b1833;color:#a9d3ff}\n#log{white-space:pre-wrap;height:220px;overflow:auto;background:#0b1222;border-radius:10px;padding:12px;font:12px/1.6 monospace;color:#c1dbfa}\ncode{color:#ffd977}small{color:#95aacc}\n</style>\n</head>\n<body><main>\n<h1>🫧 Bubble Battle · 서버 테스트</h1>\n<p>Cloudflare Workers + Durable Objects 연결 테스트. 지연 원인 분리 벤치: <a href=\"/diag\" style=\"color:#ffd977\">/diag (Worker vs DO Echo)</a></p>\n<div class=\"row\"><button id=\"create\">새 방 만들기</button><input id=\"code\" maxlength=\"6\" placeholder=\"방 코드\" autocomplete=\"off\"><button id=\"join\" class=\"secondary\">방 참가</button></div>\n<div id=\"status\" class=\"status\">연결 안 됨</div>\n<div class=\"row\"><button id=\"ready\" disabled>준비 완료</button><button id=\"send\" disabled class=\"secondary\">테스트 메시지 전송</button><button id=\"leave\" disabled class=\"secondary\">연결 해제</button></div>\n<p><small>테스트 방법: 한 탭에서 방 만들기 → 다른 탭/기기에서 같은 사이트 접속 → 코드 입력 → 두 쪽에서 준비 완료 → 메시지 전송</small></p>\n<div id=\"log\" aria-label=\"서버 로그\"></div>\n</main>\n<script>\nlet socket=null, roomCode=null, hostToken=null, ready=false;\nconst $=id=>document.getElementById(id);\nfunction log(s){ $('log').textContent += `${new Date().toLocaleTimeString()} ${s}\\n`; $('log').scrollTop=$('log').scrollHeight; }\nfunction status(s){ $('status').textContent=s; }\nfunction send(m){if(socket && socket.readyState===WebSocket.OPEN) socket.send(JSON.stringify(m));}\nfunction controls(connected){$('ready').disabled=!connected;$('send').disabled=!connected;$('leave').disabled=!connected;}\nfunction connect(code,token){\n  if(socket)socket.close();\n  roomCode=code;hostToken=token;ready=false;\n  const protocol=location.protocol==='https:'?'wss:':'ws:';\n  socket=new WebSocket(`${protocol}//${location.host}/api/rooms/${code}/ws`);\n  status(`방 ${code} 접속 중...`);\n  socket.onopen=()=>{send({type:'join',host_token:token});log('WebSocket 연결됨');};\n  socket.onmessage=e=>{let m;try{m=JSON.parse(e.data)}catch{return}; log(JSON.stringify(m));\n    if(m.type==='joined'){controls(true);status(`방 ${code} | ${m.role==='host'?'방장 (1P)':'참가자 (2P)'}`)}\n    if(m.type==='match_start')status(`방 ${code} | 양쪽 준비 완료, 게임 시작 이벤트 수신!`);\n    if(m.type==='error')status(`오류: ${m.error}`);\n    if(m.type==='player_left')status(`방 ${code} | ${m.player}P가 나감`);\n  };\n  socket.onerror=()=>log('연결 오류. 주소 및 배포 설정 확인.');\n  socket.onclose=e=>{log(`연결 종료 ${e.code}`);controls(false);ready=false;status('연결 종료됨')};\n}\n$('create').onclick=async()=>{\n  try{let r=await fetch('/api/rooms',{method:'POST'});let d=await r.json();if(!d.ok)throw Error(JSON.stringify(d));\n    $('code').value=d.code;log(`방 생성 성공: ${d.code}`);connect(d.code,d.host_token);\n  }catch(e){log('방 생성 실패: '+e.message)}\n};\n$('join').onclick=()=>{const code=$('code').value.toUpperCase().trim();if(code.length!==6)return status('6자리 코드를 입력해 줘');connect(code,null)};\n$('ready').onclick=()=>{ready=!ready;send({type:'ready',ready});$('ready').textContent=ready?'준비 취소':'준비 완료'};\n$('send').onclick=()=>send({type:'game',event:'test_message',data:{hello:'버블 보블!',time:Date.now()}});\n$('leave').onclick=()=>{if(socket)socket.close(1000,'Left room');};\n</script></body></html>\n";
 
 export default {
   async fetch(request, env) {
@@ -66,13 +112,41 @@ export default {
       });
     }
 
+    if (url.pathname === "/diag" && request.method === "GET") {
+      return new Response(DIAG_PAGE, {
+        headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }
+      });
+    }
+
+    if (url.pathname === "/api/echo/ws") {
+      return handleWorkerEchoWs(request);
+    }
+
+    if (url.pathname === "/api/echo/info" && request.method === "GET") {
+      return json({
+        ok: true,
+        via: "worker",
+        edge_colo: edgeColo(request),
+        cf_ray: request.headers.get("cf-ray"),
+        location_hint: ROOM_LOCATION_HINT,
+        note: "edge_colo is the request entry PoP. Durable Object may run elsewhere; hint applies only at first DO create.",
+        endpoints: {
+          worker_ws: "/api/echo/ws",
+          do_ws: "/api/rooms/:code/ws",
+          diag_page: "/diag"
+        }
+      });
+    }
+
     if (url.pathname === "/api/health" && request.method === "GET") {
       return json({
         ok: true,
         service: "puzzle-bobble-room-server",
-        version: 4,
+        version: 5,
         location_hint: ROOM_LOCATION_HINT,
-        note: "location_hint applies only on first getByName for a new DO name",
+        edge_colo: edgeColo(request),
+        note: "location_hint applies only on first getByName for a new DO name; edge_colo ≠ DO location",
+        echo: { worker_ws: "/api/echo/ws", diag_page: "/diag" },
         limits: { ws: MAX_WS_MESSAGE_CHARS, game: GAME_DATA_LIMITS }
       });
     }
@@ -159,7 +233,11 @@ export class Room extends DurableObject {
       this.send(ws, {
         type: "diag_echo_reply",
         id: msg.id,
+        token: msg.token ?? null,
+        t_client_us: msg.t_client_us ?? null,
         path: "fast",
+        via: "do",
+        location_hint: ROOM_LOCATION_HINT,
         server_proc_ms: procMs
       });
       return true;
@@ -308,7 +386,11 @@ export class Room extends DurableObject {
       this.send(ws, {
         type: "diag_echo_reply",
         id: msg.id,
+        token: msg.token ?? null,
+        t_client_us: msg.t_client_us ?? null,
         path: "storage",
+        via: "do_storage",
+        location_hint: ROOM_LOCATION_HINT,
         server_proc_ms: procMs,
         room_ok: !!(roomSlow && Date.now() < roomSlow.expiresAt)
       });
