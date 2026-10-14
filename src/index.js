@@ -14,6 +14,12 @@ const GAME_DATA_LIMITS = {
   quit: 256
 };
 const ALLOWED_GAME_EVENTS = new Set(Object.keys(GAME_DATA_LIMITS));
+/** Northeast Asia-Pacific (KR/JP) — best-effort; only first getByName for a name applies. */
+const ROOM_LOCATION_HINT = "apac-ne";
+
+function roomStub(env, code) {
+  return env.ROOMS.getByName(code, { locationHint: ROOM_LOCATION_HINT });
+}
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -64,7 +70,8 @@ export default {
       return json({
         ok: true,
         service: "puzzle-bobble-room-server",
-        version: 2,
+        version: 3,
+        location_hint: ROOM_LOCATION_HINT,
         limits: { ws: MAX_WS_MESSAGE_CHARS, game: GAME_DATA_LIMITS }
       });
     }
@@ -73,7 +80,7 @@ export default {
       for (let attempt = 0; attempt < 8; attempt++) {
         const code = randomRoomCode();
         const hostToken = crypto.randomUUID();
-        const room = env.ROOMS.getByName(code);
+        const room = roomStub(env, code);
         const created = await room.fetch("https://internal/internal/init", {
           method: "POST",
           body: JSON.stringify({ code, hostToken })
@@ -84,6 +91,7 @@ export default {
             ok: true,
             code,
             host_token: hostToken,
+            location_hint: ROOM_LOCATION_HINT,
             websocket_url: `${protocol}//${url.host}/api/rooms/${code}/ws`
           }, 201);
         }
@@ -94,7 +102,7 @@ export default {
 
     const match = url.pathname.match(/^\/api\/rooms\/([A-Z2-9]{6})(?:\/(ws))?$/);
     if (!match || !isRoomCode(match[1])) return json({ error: "not_found" }, 404);
-    const room = env.ROOMS.getByName(match[1]);
+    const room = roomStub(env, match[1]);
 
     if (match[2] === "ws") {
       if (request.method !== "GET" || request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
