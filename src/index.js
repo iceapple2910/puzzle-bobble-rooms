@@ -152,12 +152,14 @@ export default {
       return json({
         ok: true,
         service: "puzzle-bobble-room-server",
-        version: 6,
+        version: 7,
+        signaling_version: 2,
         location_hint: ROOM_LOCATION_HINT,
         edge_colo: edgeColo(request),
         note: "location_hint applies only on first getByName for a new DO name; edge_colo ≠ DO location",
         echo: { worker_ws: "/api/echo/ws", diag_page: "/diag" },
         webrtc_signaling: ["webrtc_sdp", "webrtc_ice"],
+        signal_types: ["signal"],
         limits: { ws: MAX_WS_MESSAGE_CHARS, game: GAME_DATA_LIMITS }
       });
     }
@@ -316,7 +318,12 @@ export class Room extends DurableObject {
     if (event === "webrtc_ice") {
       if (data == null || typeof data !== "object") return "bad_webrtc_ice";
       if (typeof data.mid !== "string" || data.mid.length > 64) return "bad_webrtc_ice_mid";
-      if (typeof data.index !== "number" || !Number.isFinite(data.index)) return "bad_webrtc_ice_index";
+      // Godot JSON may emit index as int or float; accept both / numeric string.
+      const idx = data.index;
+      const indexOk =
+        (typeof idx === "number" && Number.isFinite(idx)) ||
+        (typeof idx === "string" && idx.length > 0 && Number.isFinite(Number(idx)));
+      if (!indexOk) return "bad_webrtc_ice_index";
       if (typeof data.candidate !== "string" || data.candidate.length < 1 || data.candidate.length > 1800) {
         return "bad_webrtc_ice_candidate";
       }
@@ -398,10 +405,37 @@ export class Room extends DurableObject {
       code: room.code,
       location_hint: room.locationHint || null,
       created_at: room.createdAt || null,
+      signaling_version: 2,
+      webrtc_signaling: true,
       message: "Send {type:'join', host_token?:'...'}"
     });
     console.log(`ws_accept code=${room.code}`);
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /** Relay WebRTC SDP/ICE. Prefer top-level type=signal (works pre-match_start). */
+  relaySignal(ws, slot, room, event, data) {
+    console.log(`SIGNAL_RECEIVED code=${room.code} from=${slot} event=${event}`);
+    if (!WEBRTC_SIGNAL_EVENTS.has(event)) {
+      console.log(`SIGNAL_REJECTED code=${room.code} from=${slot} event=${event} reason=unknown_event`);
+      this.send(ws, { type: "error", error: "unknown_signal_event", event });
+      return;
+    }
+    if (this.peers().length < 2) {
+      console.log(`SIGNAL_REJECTED code=${room.code} from=${slot} event=${event} reason=signal_need_two_players peers=${this.peers().length}`);
+      this.send(ws, { type: "error", error: "signal_need_two_players", event });
+      return;
+    }
+    const err = this.validateGameRelay(slot, event, data);
+    if (err) {
+      console.log(`SIGNAL_REJECTED code=${room.code} from=${slot} event=${event} reason=${err}`);
+      this.send(ws, { type: "error", error: err, event });
+      return;
+    }
+    const others = this.peers().filter(p => p.ws !== ws).length;
+    this.broadcast({ type: "signal", from: slot, event, data: data ?? null }, ws);
+    this.send(ws, { type: "signal_ack", event, ok: true, peers: others });
+    console.log(`SIGNAL_RELAYED code=${room.code} from=${slot} event=${event} to_peers=${others}`);
   }
 
   async webSocketMessage(ws, raw) {
@@ -469,7 +503,9 @@ export class Room extends DurableObject {
         role: slot === 1 ? "host" : "guest",
         code: room.code,
         location_hint: room.locationHint || null,
-        created_at: room.createdAt || null
+        created_at: room.createdAt || null,
+        signaling_version: 2,
+        webrtc_signaling: true
       });
       this.broadcast(this.presence());
       console.log(`joined code=${room.code} player=${slot} hint=${room.locationHint || "?"}`);
@@ -477,6 +513,18 @@ export class Room extends DurableObject {
     }
 
     const slot = oldAttachment.slot;
+
+    // Dedicated WebRTC signaling channel (preferred over type=game).
+    if (msg.type === "signal") {
+      if (typeof msg.event !== "string") {
+        console.log(`SIGNAL_REJECTED code=${room.code} from=${slot} reason=bad_event`);
+        this.send(ws, { type: "error", error: "invalid_signal_event" });
+        return;
+      }
+      this.relaySignal(ws, slot, room, msg.event, msg.data);
+      return;
+    }
+
     if (msg.type === "ready" && typeof msg.ready === "boolean") {
       ws.serializeAttachment({ ...oldAttachment, ready: msg.ready });
       this.broadcast(this.presence());
@@ -496,23 +544,19 @@ export class Room extends DurableObject {
         return;
       }
       const isSignal = WEBRTC_SIGNAL_EVENTS.has(msg.event);
-      // WebRTC SDP/ICE may exchange in lobby before match_start; game payloads still need started.
-      if (!room.started && !isSignal) {
-        this.send(ws, { type: "error", error: "match_not_started" });
+      // Legacy: webrtc_* still accepted as type=game for older clients.
+      if (isSignal) {
+        this.relaySignal(ws, slot, room, msg.event, msg.data);
         return;
       }
-      if (isSignal && this.peers().length < 2) {
-        this.send(ws, { type: "error", error: "signal_need_two_players" });
+      if (!room.started) {
+        this.send(ws, { type: "error", error: "match_not_started" });
         return;
       }
       const err = this.validateGameRelay(slot, msg.event, msg.data);
       if (err) {
         this.send(ws, { type: "error", error: err });
         return;
-      }
-      // Do not log SDP/ICE bodies or candidate addresses.
-      if (isSignal) {
-        console.log(`signal code=${room.code} from=${slot} event=${msg.event}`);
       }
       this.broadcast(
         { type: "game", from: slot, event: msg.event, data: msg.data ?? null },
