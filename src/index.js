@@ -152,7 +152,7 @@ export default {
       return json({
         ok: true,
         service: "puzzle-bobble-room-server",
-        version: 7,
+        version: 8,
         signaling_version: 2,
         location_hint: ROOM_LOCATION_HINT,
         edge_colo: edgeColo(request),
@@ -226,7 +226,11 @@ export class Room extends DurableObject {
   }
 
   presence() {
-    const players = this.peers().map(p => ({ player: p.slot, ready: !!p.ready }));
+    const players = this.peers().map(p => ({
+      player: p.slot,
+      ready: !!p.ready,
+      name: typeof p.name === "string" ? p.name.slice(0, 12) : ""
+    }));
     return { type: "presence", players };
   }
 
@@ -494,8 +498,8 @@ export class Room extends DurableObject {
         ws.close(1008, "Slot unavailable");
         return;
       }
-      const displayName =
-        typeof msg.name === "string" ? msg.name.slice(0, 16) : "";
+      const rawName = typeof msg.name === "string" ? msg.name : "";
+      const displayName = rawName.replace(/[^\w\- ]+/g, "").trim().slice(0, 12);
       ws.serializeAttachment({ slot, ready: false, name: displayName });
       this.send(ws, {
         type: "joined",
@@ -505,7 +509,8 @@ export class Room extends DurableObject {
         location_hint: room.locationHint || null,
         created_at: room.createdAt || null,
         signaling_version: 2,
-        webrtc_signaling: true
+        webrtc_signaling: true,
+        name: displayName
       });
       this.broadcast(this.presence());
       console.log(`joined code=${room.code} player=${slot} hint=${room.locationHint || "?"}`);
@@ -581,7 +586,11 @@ export class Room extends DurableObject {
       p.ws.serializeAttachment({ slot: p.slot, ready: false, name: p.name || "" });
       this.send(p.ws, {
         type: "presence",
-        players: remaining.map(a => ({ player: a.slot, ready: false }))
+        players: remaining.map(a => ({
+          player: a.slot,
+          ready: false,
+          name: typeof a.name === "string" ? a.name.slice(0, 12) : ""
+        }))
       });
     }
     console.log(`player_left code=${room?.code} player=${attachment.slot}`);
