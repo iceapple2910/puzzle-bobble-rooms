@@ -12,9 +12,19 @@ const GAME_DATA_LIMITS = {
   client_input: 512,
   state: 49152,
   sfx: 2048,
-  quit: 256
+  quit: 256,
+  /** WebRTC signaling (SDP can be large; still capped). */
+  webrtc_sdp: 24576,
+  webrtc_ice: 2048
 };
 const ALLOWED_GAME_EVENTS = new Set(Object.keys(GAME_DATA_LIMITS));
+/** Signaling allowed before match_start (room join only). */
+const WEBRTC_SIGNAL_EVENTS = new Set(["webrtc_sdp", "webrtc_ice"]);
+/** Per-slot rate limits for signaling abuse prevention. */
+const SIGNAL_RATE = {
+  webrtc_sdp: { windowMs: 10000, max: 8 },
+  webrtc_ice: { windowMs: 10000, max: 60 }
+};
 /** Northeast Asia-Pacific (KR/JP) — best-effort; only first getByName for a name applies. */
 const ROOM_LOCATION_HINT = "apac-ne";
 
@@ -142,11 +152,12 @@ export default {
       return json({
         ok: true,
         service: "puzzle-bobble-room-server",
-        version: 5,
+        version: 6,
         location_hint: ROOM_LOCATION_HINT,
         edge_colo: edgeColo(request),
         note: "location_hint applies only on first getByName for a new DO name; edge_colo ≠ DO location",
         echo: { worker_ws: "/api/echo/ws", diag_page: "/diag" },
+        webrtc_signaling: ["webrtc_sdp", "webrtc_ice"],
         limits: { ws: MAX_WS_MESSAGE_CHARS, game: GAME_DATA_LIMITS }
       });
     }
@@ -268,7 +279,24 @@ export class Room extends DurableObject {
     return false;
   }
 
-  /** Host-authoritative relay rules for Godot game events. */
+  /** Sliding-window rate limit for WebRTC signaling (no IP/token logging). */
+  checkSignalRate(slot, event) {
+    const cfg = SIGNAL_RATE[event];
+    if (!cfg) return null;
+    if (!this._signalRates) this._signalRates = new Map();
+    const key = `${slot}:${event}`;
+    const now = Date.now();
+    let bucket = this._signalRates.get(key);
+    if (!bucket || now - bucket.start > cfg.windowMs) {
+      bucket = { start: now, count: 0 };
+      this._signalRates.set(key, bucket);
+    }
+    bucket.count += 1;
+    if (bucket.count > cfg.max) return "signal_rate_limited";
+    return null;
+  }
+
+  /** Host-authoritative relay rules for Godot game events + WebRTC signaling. */
   validateGameRelay(fromSlot, event, data) {
     if (!ALLOWED_GAME_EVENTS.has(event)) {
       return "unknown_game_event";
@@ -276,6 +304,23 @@ export class Room extends DurableObject {
     const limit = GAME_DATA_LIMITS[event];
     if (dataSize(data) > limit) {
       return "game_data_too_large";
+    }
+    if (event === "webrtc_sdp") {
+      if (data == null || typeof data !== "object") return "bad_webrtc_sdp";
+      if (data.type !== "offer" && data.type !== "answer") return "bad_webrtc_sdp_type";
+      if (typeof data.sdp !== "string" || data.sdp.length < 1 || data.sdp.length > 24000) {
+        return "bad_webrtc_sdp_body";
+      }
+      return this.checkSignalRate(fromSlot, event);
+    }
+    if (event === "webrtc_ice") {
+      if (data == null || typeof data !== "object") return "bad_webrtc_ice";
+      if (typeof data.mid !== "string" || data.mid.length > 64) return "bad_webrtc_ice_mid";
+      if (typeof data.index !== "number" || !Number.isFinite(data.index)) return "bad_webrtc_ice_index";
+      if (typeof data.candidate !== "string" || data.candidate.length < 1 || data.candidate.length > 1800) {
+        return "bad_webrtc_ice_candidate";
+      }
+      return this.checkSignalRate(fromSlot, event);
     }
     if (event === "client_input") {
       if (fromSlot !== 2) return "client_input_guest_only";
@@ -446,18 +491,28 @@ export class Room extends DurableObject {
       return;
     }
     if (msg.type === "game") {
-      if (!room.started) {
+      if (typeof msg.event !== "string" || !/^[a-z_]{1,32}$/.test(msg.event)) {
+        this.send(ws, { type: "error", error: "invalid_game_event" });
+        return;
+      }
+      const isSignal = WEBRTC_SIGNAL_EVENTS.has(msg.event);
+      // WebRTC SDP/ICE may exchange in lobby before match_start; game payloads still need started.
+      if (!room.started && !isSignal) {
         this.send(ws, { type: "error", error: "match_not_started" });
         return;
       }
-      if (typeof msg.event !== "string" || !/^[a-z_]{1,32}$/.test(msg.event)) {
-        this.send(ws, { type: "error", error: "invalid_game_event" });
+      if (isSignal && this.peers().length < 2) {
+        this.send(ws, { type: "error", error: "signal_need_two_players" });
         return;
       }
       const err = this.validateGameRelay(slot, msg.event, msg.data);
       if (err) {
         this.send(ws, { type: "error", error: err });
         return;
+      }
+      // Do not log SDP/ICE bodies or candidate addresses.
+      if (isSignal) {
+        console.log(`signal code=${room.code} from=${slot} event=${msg.event}`);
       }
       this.broadcast(
         { type: "game", from: slot, event: msg.event, data: msg.data ?? null },
