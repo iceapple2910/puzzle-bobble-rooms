@@ -152,7 +152,7 @@ export default {
       return json({
         ok: true,
         service: "puzzle-bobble-room-server",
-        version: 8,
+        version: 9,
         signaling_version: 2,
         location_hint: ROOM_LOCATION_HINT,
         edge_colo: edgeColo(request),
@@ -368,7 +368,10 @@ export class Room extends DurableObject {
         expiresAt: now + ROOM_LIFETIME_MS,
         started: false,
         locationHint: ROOM_LOCATION_HINT,
-        createdAt: now
+        createdAt: now,
+        /** 0=ALWAYS 1=VANISH 2=NEVER */
+        guideMode: 2,
+        marginSec: 35
       };
       await this.ctx.storage.put("room", room);
       this._roomCache = room;
@@ -530,6 +533,17 @@ export class Room extends DurableObject {
       return;
     }
 
+    // Host-only room options (guideline / margin) — before or after join.
+    if (msg.type === "room_opts" && slot === 1) {
+      const guide = Number.isFinite(msg.guide) ? Math.max(0, Math.min(2, Math.floor(msg.guide))) : room.guideMode ?? 2;
+      const margin = Number.isFinite(msg.margin) ? Math.max(0, Math.min(120, Math.floor(msg.margin))) : room.marginSec ?? 35;
+      const next = { ...room, guideMode: guide, marginSec: margin };
+      await this.ctx.storage.put("room", next);
+      this._roomCache = next;
+      this.broadcast({ type: "room_opts", guide, margin });
+      return;
+    }
+
     if (msg.type === "ready" && typeof msg.ready === "boolean") {
       ws.serializeAttachment({ ...oldAttachment, ready: msg.ready });
       this.broadcast(this.presence());
@@ -538,7 +552,11 @@ export class Room extends DurableObject {
         const next = { ...room, started: true };
         await this.ctx.storage.put("room", next);
         this._roomCache = next;
-        this.broadcast({ type: "match_start" });
+        this.broadcast({
+          type: "match_start",
+          guide: next.guideMode ?? 2,
+          margin: next.marginSec ?? 35
+        });
         console.log(`match_start code=${room.code}`);
       }
       return;
